@@ -294,19 +294,87 @@ function ScanTerminal({ phase, toolStatus, liveStepLabel, elapsedSeconds, repoUr
   );
 }
 
-// Weighted 0-100 health score from the severity mix, mapped to a letter
-// grade. Purely a summarizing device - it does not affect the findings.
+// --- Health score: weighted by actual threat, not just finding count ---
+//
+// Three deliberate design choices, each correcting a real flaw in naive
+// "subtract points per finding" scoring:
+//
+// 1. DIMINISHING RETURNS PER SEVERITY TIER (sqrt scaling)
+//    The 1st HIGH finding in a repo is a much bigger signal than the 15th -
+//    by then you already know the repo has a HIGH problem, and finding #15
+//    doesn't double how bad that is. Flat linear penalties let ANY tier
+//    mathematically floor the whole score once you cross a handful of
+//    findings, which stops the grade from distinguishing "risky" from
+//    "catastrophic." sqrt(count) keeps it climbing, just sub-linearly.
+//
+// 2. CATEGORY WEIGHTING (your code vs. dependency noise)
+//    A hardcoded secret or an insecure Dockerfile (gitleaks/semgrep/checkov)
+//    is squarely your responsibility and directly exploitable. A CVE in a
+//    transitive dependency (trivy/SCA) is often unreachable in practice and
+//    is exactly the kind of noise real teams triage with skepticism (this is
+//    why `npm audit` results get argued about constantly). Dependency
+//    findings count, but at reduced weight, not 1:1 with code you wrote.
+//
+// 3. CONFIDENCE DISCOUNTING + A HARD CRITICAL CEILING
+//    Findings the scanner itself already flagged as likely test/placeholder
+//    data barely move the score - they've already been shown not to be real
+//    secrets. Conversely, a genuine, non-test-data CRITICAL is a decisive
+//    signal on its own: real security scorecards treat "you have an actual
+//    exploitable critical" as disqualifying regardless of what else looks
+//    clean, so it caps the achievable grade rather than being averaged away.
+
+const SEVERITY_BASE_WEIGHT = { CRITICAL: 20, HIGH: 10, MEDIUM: 4, LOW: 1 };
+
+// gitleaks/semgrep/checkov findings are about code you own; trivy findings
+// are about dependencies you didn't write and often can't immediately fix.
+const CATEGORY_WEIGHT = { gitleaks: 1, semgrep: 1, checkov: 1, trivy: 0.6 };
+
+function isLikelyTestData(finding) {
+  return (finding.ruleName || '').includes('[Likely test data]');
+}
+
+function categoryWeightFor(finding) {
+  // Unattributed legacy findings (scanned before tool-tagging existed)
+  // default to full weight - safer than silently under-penalizing them.
+  return finding.tool && CATEGORY_WEIGHT[finding.tool] !== undefined
+    ? CATEGORY_WEIGHT[finding.tool]
+    : 1;
+}
+
+function confidenceWeightFor(finding) {
+  return isLikelyTestData(finding) ? 0.1 : 1;
+}
+
 function computeHealthScore(findings) {
-  const penalty = countSeverity(findings, 'CRITICAL') * 18
-    + countSeverity(findings, 'HIGH') * 9
-    + countSeverity(findings, 'MEDIUM') * 4
-    + countSeverity(findings, 'LOW') * 1.5;
-  const score = Math.max(4, Math.round(100 - penalty));
+  const bySeverity = { CRITICAL: [], HIGH: [], MEDIUM: [], LOW: [] };
+  findings.forEach((f) => {
+    const sev = SEVERITY_BASE_WEIGHT[f.severity] !== undefined ? f.severity : 'LOW';
+    bySeverity[sev].push(f);
+  });
+
+  let penalty = 0;
+  Object.entries(bySeverity).forEach(([sev, list]) => {
+    if (list.length === 0) return;
+    const weightedCount = list.reduce(
+      (sum, f) => sum + categoryWeightFor(f) * confidenceWeightFor(f), 0
+    );
+    if (weightedCount <= 0) return;
+    penalty += SEVERITY_BASE_WEIGHT[sev] * Math.sqrt(weightedCount);
+  });
+
+  let score = Math.max(0, Math.min(100, Math.round(100 - penalty)));
+
+  // Hard ceiling: a confirmed (non-test-data) CRITICAL can't be diluted
+  // away by a pile of low-stakes dependency findings elsewhere.
+  const realCriticals = bySeverity.CRITICAL.filter((f) => !isLikelyTestData(f)).length;
+  if (realCriticals >= 2) score = Math.min(score, 24);
+  else if (realCriticals === 1) score = Math.min(score, 54);
+
   let grade = 'A';
   let colorVar = '--medium';
-  if (score < 50) { grade = 'F'; colorVar = '--critical'; }
-  else if (score < 65) { grade = 'D'; colorVar = '--critical'; }
-  else if (score < 78) { grade = 'C'; colorVar = '--high'; }
+  if (score < 40) { grade = 'F'; colorVar = '--critical'; }
+  else if (score < 60) { grade = 'D'; colorVar = '--critical'; }
+  else if (score < 75) { grade = 'C'; colorVar = '--high'; }
   else if (score < 90) { grade = 'B'; colorVar = '--medium'; }
   return { score, grade, colorVar };
 }
