@@ -7,13 +7,10 @@ import {
 } from 'lucide-react';
 import './App.css';
 
-// Bookend pipeline steps, shown as the classic checklist log lines,
-// with the tool terminal sandwiched between them.
-const PRE_STEPS = ['Cloning repository', 'Walking file tree'];
-const POST_STEPS = ['Generating AI remediation patches'];
-
-// Each tool that runs during a scan, in execution order.
-// icon + accentVar drive the terminal row + the glow color while it runs.
+// Each tool that runs during a scan, in execution order. icon + accentVar
+// drive the terminal row + the glow color while it runs. The "id" here must
+// match the tool ids the backend sends in SSE progress events and stores on
+// each SecretFinding (see SecretScannerService.java / ScanOrchestratorService.java).
 const SCAN_TOOLS = [
   {
     id: 'gitleaks',
@@ -44,6 +41,7 @@ const SCAN_TOOLS = [
     accentVar: '--tool-checkov',
   },
 ];
+const TOOL_BY_ID = Object.fromEntries(SCAN_TOOLS.map((t) => [t.id, t]));
 
 const SEVERITY_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
 
@@ -54,48 +52,34 @@ const SEVERITY_STYLE = {
   LOW: { var: '--low', bg: '--low-bg' },
 };
 
-// Attributes a finding to the tool that most plausibly produced it, based
-// on the real naming conventions each tool uses for its rule IDs:
-//   - Checkov:  CKV_AWS_79, CKV2_K8S_6, CKV_DOCKER_2 ...
-//   - Trivy:    CVE-2024-12345, GHSA-xxxx-xxxx-xxxx, or its own AVD-* IDs
-//   - Semgrep:  dotted rule-id paths, e.g. python.django.security.audit.xss
-//   - Gitleaks: no fixed prefix — rule names use secret vocabulary
-//     (aws-access-key, generic-api-key, private-key, ...)
-// This is still an inference, not ground truth — a finding only carries a
-// severity/rule/path in this payload, not which process emitted it. When
-// nothing matches by rule name we fall back to file-type signals, and mark
-// the result as a "guess" so the UI doesn't overstate its confidence.
-// The reliable fix is having the backend tag findings with their source
-// tool at scan time and reading finding.tool directly instead of this.
-function classifyTool(finding) {
+// Legacy fallback ONLY: findings scanned before the backend tagged them with
+// a real `tool` field (see SecretFinding.java) won't have one. For those old
+// rows, guess from the rule-name convention so old history doesn't look
+// broken. Any finding from a fresh scan has finding.tool set directly by the
+// backend and never touches this function.
+function guessToolFromRuleName(finding) {
   const rule = (finding.ruleName || '').trim();
   const file = (finding.filePath || '').trim();
 
-  if (/^CKV2?_[A-Z0-9]+_\d+/i.test(rule)) {
-    return { id: 'checkov', confidence: 'high' };
-  }
+  if (/^\[?Likely test data]?\s*Secret:|^Secret:/i.test(rule)) return 'gitleaks';
+  if (/^SAST:/i.test(rule)) return 'semgrep';
+  if (/^SCA:/i.test(rule)) return 'trivy';
+  if (/^IaC:/i.test(rule)) return 'checkov';
 
-  if (/^(CVE-\d{4}-\d+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}|AVD-[A-Z]+-\d+)/i.test(rule)) {
-    return { id: 'trivy', confidence: 'high' };
-  }
+  if (/\.(tf|tfvars)$|\.ya?ml$|Dockerfile$|docker-compose/i.test(file)) return 'checkov';
+  if (/package-lock\.json$|requirements.*\.txt$|go\.sum$|Pipfile\.lock$|Gemfile\.lock$|pom\.xml$|\.csproj$/i.test(file)) return 'trivy';
 
-  if (/^[a-z0-9_]+(\.[a-z0-9_-]+){2,}$/i.test(rule)) {
-    return { id: 'semgrep', confidence: 'high' };
-  }
+  return 'semgrep';
+}
 
-  if (/(secret|api[-_]?key|access[-_]?key|token|password|private[-_]?key|credential)/i.test(rule)) {
-    return { id: 'gitleaks', confidence: 'high' };
+// Resolves which tool badge to show: real backend data first, legacy guess
+// as a fallback for old history rows, flagged so the UI can visually
+// distinguish "we know" from "we're guessing."
+function resolveToolAttribution(finding) {
+  if (finding.tool && TOOL_BY_ID[finding.tool]) {
+    return { id: finding.tool, confidence: 'known' };
   }
-
-  if (/\.(tf|tfvars)$|\.ya?ml$|Dockerfile$|docker-compose/i.test(file)) {
-    return { id: 'checkov', confidence: 'guess' };
-  }
-  if (/package-lock\.json$|requirements.*\.txt$|go\.sum$|Pipfile\.lock$|Gemfile\.lock$|pom\.xml$|\.csproj$/i.test(file)) {
-    return { id: 'trivy', confidence: 'guess' };
-  }
-
-  // Last resort: most general-purpose SAST tool, explicitly flagged unsure.
-  return { id: 'semgrep', confidence: 'guess' };
+  return { id: guessToolFromRuleName(finding), confidence: 'guess' };
 }
 
 function getSeverityStyle(sev) {
@@ -143,8 +127,8 @@ function StatCard({ label, value, color, max }) {
 function FindingCard({ finding, index, onExport, onCopied }) {
   const [open, setOpen] = useState(index === 0);
   const style = getSeverityStyle(finding.severity);
-  const attribution = classifyTool(finding);
-  const tool = SCAN_TOOLS.find((t) => t.id === attribution.id);
+  const attribution = resolveToolAttribution(finding);
+  const tool = TOOL_BY_ID[attribution.id];
   const ToolIcon = tool.icon;
   const isGuess = attribution.confidence === 'guess';
 
@@ -171,8 +155,8 @@ function FindingCard({ finding, index, onExport, onCopied }) {
               className={`cs-tool-badge ${isGuess ? 'cs-tool-badge--guess' : ''}`}
               style={{ color: `var(${tool.accentVar})` }}
               title={isGuess
-                ? 'Inferred from file type — rule name didn\'t match a known pattern, so this is a guess.'
-                : `Rule ID matches ${tool.name}'s naming convention.`}
+                ? 'This finding predates tool tagging, so this is inferred from the rule name, not reported directly by the backend.'
+                : `Reported directly by ${tool.name}.`}
             >
               <ToolIcon size={11} /> {tool.name}{isGuess && <span className="cs-tool-badge-q">?</span>}
             </span>
@@ -214,12 +198,6 @@ function EmptyState({ icon, title, hint }) {
   );
 }
 
-// Total pipeline: [clone, walk tree, ...4 tools, generate patches]
-const TOTAL_STEPS = PRE_STEPS.length + SCAN_TOOLS.length + POST_STEPS.length;
-const TOOLS_START = PRE_STEPS.length;
-const TOOLS_END = PRE_STEPS.length + SCAN_TOOLS.length; // exclusive
-const POST_START = TOOLS_END;
-
 function LogLine({ label, state }) {
   return (
     <div className={`cs-log-line ${state}`}>
@@ -227,17 +205,21 @@ function LogLine({ label, state }) {
         {state === 'done' && <Check size={12} />}
         {state === 'active' && <Loader2 size={12} className="animate-spin" />}
       </span>
-      {label}...
+      {label}
     </div>
   );
 }
 
-// The scan terminal: classic checklist lines for clone/walk-tree, a
-// tool-by-tool matrix in the middle (gitleaks -> semgrep -> trivy ->
-// checkov), then a closing "generating patches" line — all driven off
-// one linear step counter so the whole thing reads as one pipeline.
-function ScanTerminal({ overallStep, filesScanned, repoUrl }) {
-  const toolIndex = Math.min(Math.max(overallStep - TOOLS_START, 0), SCAN_TOOLS.length);
+// The scan terminal, now driven entirely by real backend state instead of a
+// simulated timer:
+//   - phase: the job's current ScanJob.Status ('PENDING'|'CLONING'|'SCANNING'|'ENRICHING'|'SAVING'|'COMPLETE'|'ERROR')
+//   - toolStatus: { gitleaks: 'pending'|'running'|'done', ... } built from real SSE "tool" fields
+//   - liveStepLabel: the exact text the backend sent for the current step
+//     (e.g. "Generating AI remediation patch (3/12)") - no fabricated counters.
+function ScanTerminal({ phase, toolStatus, liveStepLabel, elapsedSeconds, repoUrl }) {
+  const cloneState = phase === 'PENDING' ? 'pending' : phase === 'CLONING' ? 'active' : 'done';
+  const showTools = phase !== 'PENDING' && phase !== 'CLONING';
+  const showLiveLine = phase === 'ENRICHING' || phase === 'SAVING';
 
   return (
     <div className="cs-terminal">
@@ -249,22 +231,20 @@ function ScanTerminal({ overallStep, filesScanned, repoUrl }) {
       </div>
 
       <div className="cs-terminal-log">
-        {PRE_STEPS.map((label, i) => (
-          <LogLine
-            key={label}
-            label={label}
-            state={overallStep > i ? 'done' : overallStep === i ? 'active' : 'pending'}
-          />
-        ))}
+        <LogLine label="Cloning repository" state={cloneState} />
       </div>
 
-      {overallStep >= TOOLS_START && (
+      {showTools && (
         <div className="cs-terminal-body">
-          {SCAN_TOOLS.map((tool, i) => {
-            const state = i < toolIndex ? 'done' : i === toolIndex && overallStep < TOOLS_END ? 'running' : overallStep >= TOOLS_END ? 'done' : 'pending';
+          {SCAN_TOOLS.map((tool) => {
+            // Once we've moved past SCANNING entirely, every tool is done
+            // regardless of what the last known per-tool state was.
+            const state = (phase === 'ENRICHING' || phase === 'SAVING' || phase === 'COMPLETE')
+              ? 'done'
+              : (toolStatus[tool.id] || 'pending');
             const Icon = tool.icon;
             return (
-              <div key={tool.id} className={`cs-tool-row cs-tool-row--${state}`}>
+              <div key={tool.id} className={`cs-tool-row cs-tool-row--${state === 'running' ? 'running' : state === 'done' ? 'done' : 'pending'}`}>
                 <span
                   className="cs-tool-icon"
                   style={{
@@ -300,28 +280,22 @@ function ScanTerminal({ overallStep, filesScanned, repoUrl }) {
         </div>
       )}
 
-      {overallStep >= TOOLS_END && (
+      {showLiveLine && (
         <div className="cs-terminal-log cs-terminal-log--post">
-          {POST_STEPS.map((label, i) => (
-            <LogLine
-              key={label}
-              label={label}
-              state={overallStep > POST_START + i ? 'done' : overallStep === POST_START + i ? 'active' : 'pending'}
-            />
-          ))}
+          <LogLine label={liveStepLabel} state="active" />
         </div>
       )}
 
       <div className="cs-terminal-footer">
         <span className="cs-terminal-caret" />
-        {filesScanned} files analyzed
+        {elapsedSeconds}s elapsed
       </div>
     </div>
   );
 }
 
 // Weighted 0-100 health score from the severity mix, mapped to a letter
-// grade. Purely a summarizing device — it does not affect the findings.
+// grade. Purely a summarizing device - it does not affect the findings.
 function computeHealthScore(findings) {
   const penalty = countSeverity(findings, 'CRITICAL') * 18
     + countSeverity(findings, 'HIGH') * 9
@@ -423,14 +397,19 @@ export default function App() {
   const [scanResult, setScanResult] = useState(null);
   const [view, setView] = useState('scan');
   const [historyData, setHistoryData] = useState([]);
-  const [overallStep, setOverallStep] = useState(0);
-  const [filesScanned, setFilesScanned] = useState(0);
   const [activeSeverity, setActiveSeverity] = useState('ALL');
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
-  const stepTimer = useRef(null);
-  const filesTimer = useRef(null);
+
+  // Real scan state, driven by SSE events - nothing here is simulated.
+  const [phase, setPhase] = useState('PENDING');
+  const [toolStatus, setToolStatus] = useState({});
+  const [liveStepLabel, setLiveStepLabel] = useState('');
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  const eventSourceRef = useRef(null);
+  const elapsedTimerRef = useRef(null);
   const repoInputRef = useRef(null);
 
   const pushToast = (message) => {
@@ -439,33 +418,101 @@ export default function App() {
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3200);
   };
 
+  const closeStream = () => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    if (elapsedTimerRef.current) {
+      clearInterval(elapsedTimerRef.current);
+      elapsedTimerRef.current = null;
+    }
+  };
+
+  const applyProgress = (data) => {
+    setPhase(data.status);
+    setLiveStepLabel(data.step);
+
+    if (data.tool) {
+      // Mark any previously-running tool as done, then start the new one.
+      setToolStatus((prev) => {
+        const next = { ...prev };
+        Object.keys(next).forEach((id) => {
+          if (next[id] === 'running') next[id] = 'done';
+        });
+        next[data.tool] = 'running';
+        return next;
+      });
+    }
+  };
+
+  const fetchJobResult = async (jobId) => {
+    try {
+      const response = await axios.get(`http://localhost:8080/scan/${jobId}`);
+      setScanResult(response.data);
+    } catch (err) {
+      pushToast('Scan finished, but results could not be loaded.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleScan = async (e) => {
     e.preventDefault();
     setLoading(true);
     setScanResult(null);
     setActiveSeverity('ALL');
-    setOverallStep(0);
-    setFilesScanned(0);
+    setPhase('PENDING');
+    setToolStatus({});
+    setLiveStepLabel('');
+    setElapsedSeconds(0);
+    closeStream();
 
-    // Advances clone -> walk tree -> each tool -> generate patches.
-    // Holds on the last step (spinner stays up) until the request resolves.
-    stepTimer.current = setInterval(() => {
-      setOverallStep((i) => Math.min(i + 1, TOTAL_STEPS - 1));
-    }, 850);
-
-    filesTimer.current = setInterval(() => {
-      setFilesScanned((n) => n + Math.ceil(Math.random() * 9));
-    }, 140);
+    const startedAt = Date.now();
+    elapsedTimerRef.current = setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
 
     try {
-      const response = await axios.post('http://localhost:8080/start', { repoUrl });
-      setScanResult(response.data);
+      const startResponse = await axios.post('http://localhost:8080/start', { repoUrl });
+      const jobId = startResponse.data.jobId;
+
+      const es = new EventSource(`http://localhost:8080/scan/${jobId}/stream`);
+      eventSourceRef.current = es;
+
+      es.addEventListener('progress', (evt) => {
+        applyProgress(JSON.parse(evt.data));
+      });
+
+      es.addEventListener('complete', () => {
+        setPhase('COMPLETE');
+        closeStream();
+        fetchJobResult(jobId);
+      });
+
+      es.addEventListener('error', (evt) => {
+        let message = 'Scan failed to run. Check the backend logs.';
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.message) message = data.message;
+        } catch { /* non-JSON error frame, use default */ }
+        pushToast(message);
+        setPhase('ERROR');
+        closeStream();
+        setLoading(false);
+      });
+
+      // Underlying connection dropped unexpectedly (not a scan-level error).
+      es.onerror = () => {
+        if (eventSourceRef.current) {
+          pushToast('Lost connection to the scan. It may still be running on the backend.');
+          closeStream();
+          setLoading(false);
+        }
+      };
     } catch (err) {
-      pushToast('Scan failed to run. Check the backend logs.');
-    } finally {
-      clearInterval(stepTimer.current);
-      clearInterval(filesTimer.current);
-      setOverallStep(TOTAL_STEPS);
+      pushToast('Scan failed to start. Check the backend logs.');
+      closeStream();
       setLoading(false);
     }
   };
@@ -496,10 +543,7 @@ export default function App() {
 
   useEffect(() => {
     if (view === 'history') fetchHistory();
-    return () => {
-      clearInterval(stepTimer.current);
-      clearInterval(filesTimer.current);
-    };
+    return () => closeStream();
   }, [view]);
 
   useEffect(() => {
@@ -611,7 +655,13 @@ export default function App() {
               {loading && (
                 <div className="cs-scan-progress">
                   <div className="cs-beam-track"><div className="cs-beam" /></div>
-                  <ScanTerminal overallStep={overallStep} filesScanned={filesScanned} repoUrl={repoUrl} />
+                  <ScanTerminal
+                    phase={phase}
+                    toolStatus={toolStatus}
+                    liveStepLabel={liveStepLabel}
+                    elapsedSeconds={elapsedSeconds}
+                    repoUrl={repoUrl}
+                  />
                 </div>
               )}
             </div>
